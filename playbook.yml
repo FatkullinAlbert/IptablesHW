@@ -1,0 +1,175 @@
+---
+- name: Настройка всех хостов
+  hosts: all
+  become: yes
+  gather_facts: yes
+
+  tasks:
+    # 1. Отключаем default gateway через NAT (eth0) и устанавливаем шлюз на inetRouter (192.168.10.1)
+    - name: Удалить default gateway через eth0 (NAT)
+      command: ip route del default via 10.0.2.2
+      ignore_errors: yes
+      when: inventory_hostname != "inetRouter"
+
+    - name: Добавить default gateway через inetRouter
+      command: ip route add default via 192.168.10.1 dev eth1
+      when: inventory_hostname != "inetRouter"
+      notify: make route persistent
+
+    - name: Включить IP forwarding (для всех маршрутизаторов)
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: '1'
+        sysctl_set: yes
+        state: present
+        reload: yes
+      when: inventory_hostname in groups['routers']
+
+    # 2. Настройка inetRouter (шлюз + port knocking)
+    - name: Настройка inetRouter
+      block:
+        - name: Установить knockd и iptables-persistent
+          apt:
+            name:
+              - knockd
+              - iptables-persistent
+            state: present
+            update_cache: yes
+
+        - name: Включить NAT (masquerade) для выхода в интернет
+          iptables:
+            table: nat
+            chain: POSTROUTING
+            out_interface: eth0
+            jump: MASQUERADE
+            comment: "NAT for internal networks"
+
+        - name: Разрешить форвардинг между интерфейсами (eth1 -> eth0)
+          iptables:
+            chain: FORWARD
+            in_interface: eth1
+            out_interface: eth0
+            jump: ACCEPT
+
+        - name: Разрешить форвардинг между интерфейсами (eth0 -> eth1)
+          iptables:
+            chain: FORWARD
+            in_interface: eth0
+            out_interface: eth1
+            jump: ACCEPT
+
+        - name: Заблокировать SSH по умолчанию (цепочка INPUT)
+          iptables:
+            chain: INPUT
+            protocol: tcp
+            destination_port: 22
+            jump: DROP
+
+        - name: Настроить knockd
+          template:
+            src: knockd.conf.j2
+            dest: /etc/knockd.conf
+          notify: restart knockd
+
+        - name: Включить knockd в автозагрузку
+          systemd:
+            name: knockd
+            enabled: yes
+            state: started
+
+        - name: Сохранить правила iptables
+          shell: iptables-save > /etc/iptables/rules.v4
+      when: inventory_hostname == "inetRouter"
+
+    # 3. Настройка centralRouter (установка knock-клиента)
+    - name: Настройка centralRouter
+      block:
+        - name: Установить knockd (клиент)
+          apt:
+            name: knockd
+            state: present
+      when: inventory_hostname == "centralRouter"
+
+    # 4. Настройка inetRouter2 (проброс порта на centralServer)
+    - name: Настройка inetRouter2
+      block:
+        - name: Добавить DNAT для порта 8080 -> 192.168.20.2:80
+          iptables:
+            table: nat
+            chain: PREROUTING
+            in_interface: eth2
+            protocol: tcp
+            destination_port: 8080
+            jump: DNAT
+            to_destination: 192.168.20.2:80
+            comment: "Port forward 8080 to centralServer:80"
+
+        - name: Добавить SNAT для ответного трафика от centralServer
+          iptables:
+            table: nat
+            chain: POSTROUTING
+            destination: 192.168.20.2
+            protocol: tcp
+            destination_port: 80
+            jump: MASQUERADE
+            comment: "SNAT for replies from centralServer"
+
+        - name: Разрешить форвардинг (eth2 -> eth1) для порта 80
+          iptables:
+            chain: FORWARD
+            in_interface: eth2
+            out_interface: eth1
+            destination: 192.168.20.2
+            protocol: tcp
+            destination_port: 80
+            jump: ACCEPT
+
+        - name: Разрешить форвардинг (eth1 -> eth2) для ответов
+          iptables:
+            chain: FORWARD
+            in_interface: eth1
+            out_interface: eth2
+            source: 192.168.20.2
+            protocol: tcp
+            source_port: 80
+            jump: ACCEPT
+
+        - name: Сохранить правила iptables
+          shell: iptables-save > /etc/iptables/rules.v4
+      when: inventory_hostname == "inetRouter2"
+
+    # 5. Настройка centralServer (nginx)
+    - name: Настройка centralServer
+      block:
+        - name: Установить nginx
+          apt:
+            name: nginx
+            state: present
+            update_cache: yes
+
+        - name: Запустить и включить nginx
+          systemd:
+            name: nginx
+            enabled: yes
+            state: started
+
+        - name: Создать тестовую страницу (опционально)
+          copy:
+            content: "<h1>Hello from centralServer!</h1>"
+            dest: /var/www/html/index.html
+      when: inventory_hostname == "centralServer"
+
+  handlers:
+    - name: restart knockd
+      systemd:
+        name: knockd
+        state: restarted
+
+    - name: make route persistent
+      copy:
+        content: |
+          #!/bin/bash
+          ip route del default via 10.0.2.2 || true
+          ip route add default via 192.168.10.1 dev eth1
+        dest: /etc/network/if-up.d/set-default-gw
+        mode: 0755
